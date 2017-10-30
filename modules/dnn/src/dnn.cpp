@@ -85,15 +85,15 @@ static String toString(const T &v)
 }
 
 Mat blobFromImage(const Mat& image, double scalefactor, const Size& size,
-                  const Scalar& mean, bool swapRB)
+                  const Scalar& mean, bool swapRB, bool crop)
 {
     CV_TRACE_FUNCTION();
     std::vector<Mat> images(1, image);
-    return blobFromImages(images, scalefactor, size, mean, swapRB);
+    return blobFromImages(images, scalefactor, size, mean, swapRB, crop);
 }
 
 Mat blobFromImages(const std::vector<Mat>& images_, double scalefactor, Size size,
-                   const Scalar& mean_, bool swapRB)
+                   const Scalar& mean_, bool swapRB, bool crop)
 {
     CV_TRACE_FUNCTION();
     std::vector<Mat> images = images_;
@@ -104,13 +104,18 @@ Mat blobFromImages(const std::vector<Mat>& images_, double scalefactor, Size siz
             size = imgSize;
         if (size != imgSize)
         {
-            float resizeFactor = std::max(size.width / (float)imgSize.width,
-                                          size.height / (float)imgSize.height);
-            resize(images[i], images[i], Size(), resizeFactor, resizeFactor);
-            Rect crop(Point(0.5 * (images[i].cols - size.width),
-                            0.5 * (images[i].rows - size.height)),
-                      size);
-            images[i] = images[i](crop);
+            if(crop)
+            {
+              float resizeFactor = std::max(size.width / (float)imgSize.width,
+                                            size.height / (float)imgSize.height);
+              resize(images[i], images[i], Size(), resizeFactor, resizeFactor);
+              Rect crop(Point(0.5 * (images[i].cols - size.width),
+                              0.5 * (images[i].rows - size.height)),
+                        size);
+              images[i] = images[i](crop);
+            }
+            else
+              resize(images[i], images[i], size);
         }
         if(images[i].depth() == CV_8U)
             images[i].convertTo(images[i], CV_32F);
@@ -131,7 +136,7 @@ Mat blobFromImages(const std::vector<Mat>& images_, double scalefactor, Size siz
     Mat blob, image;
     if (nch == 3 || nch == 4)
     {
-        int sz[] = { (int)nimages, 3, image0.rows, image0.cols };
+        int sz[] = { (int)nimages, nch, image0.rows, image0.cols };
         blob = Mat(4, sz, CV_32F);
         Mat ch[4];
 
@@ -143,7 +148,7 @@ Mat blobFromImages(const std::vector<Mat>& images_, double scalefactor, Size siz
             CV_Assert(image.dims == 2 && (nch == 3 || nch == 4));
             CV_Assert(image.size() == image0.size());
 
-            for( int j = 0; j < 3; j++ )
+            for( int j = 0; j < nch; j++ )
                 ch[j] = Mat(image.rows, image.cols, CV_32F, blob.ptr((int)i, j));
             if(swapRB)
                 std::swap(ch[0], ch[2]);
@@ -589,33 +594,7 @@ struct Net::Impl
         return wrapper;
     }
 
-    class HalideCompiler : public ParallelLoopBody
-    {
-    public:
-        HalideCompiler(const MapIdToLayerData& layers_, int preferableTarget_)
-            : layers(&layers_), preferableTarget(preferableTarget_) {}
-
-        void operator()(const Range& r) const
-        {
-            MapIdToLayerData::const_iterator it = layers->begin();
-            for (int i = 0; i < r.start && it != layers->end(); ++i, ++it) {}
-            for (int i = r.start; i < r.end && it != layers->end(); ++i, ++it)
-            {
-                const LayerData &ld = it->second;
-                Ptr<Layer> layer = ld.layerInstance;
-                bool skip = ld.skipFlags.find(DNN_BACKEND_HALIDE)->second;
-                if (layer->supportBackend(DNN_BACKEND_HALIDE) && !skip)
-                {
-                    Ptr<BackendNode> node = ld.backendNodes.find(DNN_BACKEND_HALIDE)->second;
-                    dnn::compileHalide(ld.outputBlobs, node, preferableTarget);
-                }
-            }
-        }
-    private:
-        const MapIdToLayerData* layers;
-        int preferableTarget;
-    };
-
+#ifdef HAVE_HALIDE
     void compileHalide()
     {
         CV_TRACE_FUNCTION();
@@ -623,8 +602,8 @@ struct Net::Impl
         CV_Assert(preferableBackend == DNN_BACKEND_HALIDE);
 
         HalideScheduler scheduler(halideConfigFile);
-        MapIdToLayerData::iterator it;
-        for (it = layers.begin(); it != layers.end(); ++it)
+        std::vector< std::reference_wrapper<LayerData> > compileList; compileList.reserve(64);
+        for (MapIdToLayerData::iterator it = layers.begin(); it != layers.end(); ++it)
         {
             LayerData &ld = it->second;
             Ptr<Layer> layer = ld.layerInstance;
@@ -639,10 +618,30 @@ struct Net::Impl
                                                 ld.inputBlobs, ld.outputBlobs,
                                                 preferableTarget);
                 }
+                compileList.emplace_back(ld);
             }
         }
-        parallel_for_(Range(0, layers.size()), HalideCompiler(layers, preferableTarget));
+        std::atomic<int> progress(0);
+        auto fn = ([&] () -> void
+        {
+            for (;;)
+            {
+                int id = progress.fetch_add(1);
+                if ((size_t)id >= compileList.size())
+                    return;
+                const LayerData& ld = compileList[id].get();
+                Ptr<BackendNode> node = ld.backendNodes.find(DNN_BACKEND_HALIDE)->second;
+                dnn::compileHalide(ld.outputBlobs, node, preferableTarget);
+            }
+        });
+        size_t num_threads = std::min(compileList.size(), (size_t)std::thread::hardware_concurrency());
+        num_threads = std::max((size_t)1u, std::min((size_t)8u, num_threads));
+        std::vector<std::thread> threads(num_threads - 1);
+        for (auto& t: threads) t = std::thread(fn);
+        fn(); // process own tasks
+        for (auto& t: threads) t.join();
     }
+#endif
 
     void clear()
     {
@@ -692,10 +691,12 @@ struct Net::Impl
 
             if (!netWasAllocated )
             {
-                // If user didn't call compileHalide() between
-                // setPreferableBackend(DNN_BACKEND_HALIDE) and forward().
+#ifdef HAVE_HALIDE
                 if (preferableBackend == DNN_BACKEND_HALIDE)
                     compileHalide();
+#else
+                CV_Assert(preferableBackend != DNN_BACKEND_HALIDE);
+#endif
             }
 
             netWasAllocated = true;
@@ -875,7 +876,7 @@ struct Net::Impl
 
         if (preferableBackend == DNN_BACKEND_DEFAULT)
         {
-            CV_Assert(preferableTarget == DNN_TARGET_CPU);
+            CV_Assert(preferableTarget == DNN_TARGET_CPU || preferableTarget == DNN_TARGET_OPENCL);
             return;
         }
 
@@ -1000,6 +1001,7 @@ struct Net::Impl
         Ptr<Layer> layerPtr = ld.getLayerInstance();
         {
             layerPtr->finalize(ld.inputBlobs, ld.outputBlobs);
+            layerPtr->preferableTarget = preferableTarget;
 #if 0
             std::cout << "\toutputs:";
             size_t noutputs = ld.outputBlobs.size();
@@ -1026,7 +1028,7 @@ struct Net::Impl
 
     void fuseLayers(const std::vector<LayerPin>& blobsToKeep_)
     {
-        if( !fusion || preferableBackend == DNN_BACKEND_HALIDE )
+        if( !fusion || preferableBackend != DNN_BACKEND_DEFAULT)
             return;
 
         CV_TRACE_FUNCTION();
@@ -1054,6 +1056,11 @@ struct Net::Impl
             // with the current layer if they follow it. Normally, the are fused with the convolution layer,
             // but some of them (like activation) may be fused with fully-connected, elemwise (+) and
             // some other layers.
+
+            // TODO: OpenCL target support more fusion styles.
+            if ( preferableTarget == DNN_TARGET_OPENCL && ld.layerInstance->type.compare("Convolution") )
+                continue;
+
             Ptr<Layer>& currLayer = ld.layerInstance;
             if( ld.consumers.size() == 1 && pinsToKeep.count(LayerPin(lid, 0)) == 0 )
             {
@@ -1098,16 +1105,27 @@ struct Net::Impl
                     }
                 }
 
-                Ptr<ActivationLayer> nextActivLayer;
-                if( nextData )
-                    nextActivLayer = nextData->layerInstance.dynamicCast<ActivationLayer>();
-
-                if( !nextActivLayer.empty() && pinsToKeep.count(lpNext) == 0
-                        && currLayer->setActivation(nextActivLayer) )
+                // For now,  OpenCL target only support fusion with activation of ReLU/ChannelsPReLU
+                if ( preferableTarget != DNN_TARGET_OPENCL ||
+                        (preferableTarget == DNN_TARGET_OPENCL &&
+                         nextData &&
+                        (!nextData->type.compare("ReLU") ||
+                         !nextData->type.compare("ChannelsPReLU"))) )
                 {
-                    printf_(("\tfused with %s\n", nextActivLayer->name.c_str()));
-                    nextData->skipFlags[DNN_BACKEND_DEFAULT] = true;
-                    ld.outputBlobs = layers[lpNext.lid].outputBlobs;
+
+                    Ptr<ActivationLayer> nextActivLayer;
+
+                    if( nextData )
+                        nextActivLayer = nextData->layerInstance.dynamicCast<ActivationLayer>();
+
+                    if( !nextActivLayer.empty() && pinsToKeep.count(lpNext) == 0
+                            && currLayer->setActivation(nextActivLayer) )
+                    {
+                        LayerData *activData = nextData;
+                        printf_(("\tfused with %s\n", nextActivLayer->name.c_str()));
+                        activData->skipFlags[DNN_BACKEND_DEFAULT] = true;
+                        ld.outputBlobs = layers[lpNext.lid].outputBlobs;
+                    }
                 }
             }
 
@@ -1236,7 +1254,6 @@ struct Net::Impl
         }
 
         layersTimings.resize(lastLayerId + 1, 0);
-
         fuseLayers(blobsToKeep_);
     }
 
@@ -1402,7 +1419,7 @@ struct Net::Impl
         }
         else
         {
-            CV_Assert(preferableTarget == DNN_TARGET_CPU);
+            CV_Assert(preferableTarget == DNN_TARGET_CPU || preferableTarget == DNN_TARGET_OPENCL);
         }
         return ld.outputBlobs[pin.oid];
     }
@@ -1963,12 +1980,12 @@ int64 Net::getPerfProfile(std::vector<double>& timings)
 
 Importer::~Importer() {}
 
-Layer::Layer() {}
+Layer::Layer() { preferableTarget = DNN_TARGET_CPU; }
 
 Layer::Layer(const LayerParams &params)
     : blobs(params.blobs), name(params.name), type(params.type)
 {
-
+    preferableTarget = DNN_TARGET_CPU;
 }
 
 void Layer::setParamsFrom(const LayerParams &params)
