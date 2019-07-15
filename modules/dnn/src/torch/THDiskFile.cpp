@@ -1,5 +1,4 @@
 #include "../precomp.hpp"
-#if defined(ENABLE_TORCH_IMPORTER) && ENABLE_TORCH_IMPORTER
 #include "THGeneral.h"
 #include "THDiskFile.h"
 #include "THFilePrivate.h"
@@ -70,7 +69,7 @@ static size_t fread__(void *ptr, size_t size, size_t nitems, FILE *stream)
     {                                                                   \
       dfself->file.hasError = 1; /* shouldn't we put hasError to 0 all the time ? */ \
       if(!dfself->file.isQuiet)                                         \
-        THError("read error: read %d blocks instead of %d", nread, n);  \
+        THError("read error: read %ld blocks instead of %ld", nread, n);\
     }                                                                   \
                                                                         \
     return nread;                                                       \
@@ -121,7 +120,7 @@ static void THDiskFile_seek(THFile *self, long position)
   {
     dfself->file.hasError = 1;
     if(!dfself->file.isQuiet)
-      THError("unable to seek at position %d", position);
+      THError("unable to seek at position %ld", position);
   }
 }
 
@@ -352,7 +351,7 @@ static long THDiskFile_readLong(THFile *self, int64 *data, long n)
   {
     dfself->file.hasError = 1; /* shouldn't we put hasError to 0 all the time ? */
     if(!dfself->file.isQuiet)
-      THError("read error: read %d blocks instead of %d", nread, n);
+      THError("read error: read %ld blocks instead of %ld", nread, n);
   }
 
   return nread;
@@ -517,4 +516,3 @@ THFile *THDiskFile_new(const std::string &name, const char *mode, int isQuiet)
 }
 
 }
-#endif

@@ -40,6 +40,7 @@
 //
 //M*/
 
+#include "precomp.hpp"
 #include "exif.hpp"
 
 namespace {
@@ -173,7 +174,6 @@ std::map<int, ExifEntry_t > ExifReader::getExif()
                     throw ExifParsingError();
                 }
                 m_stream.read( reinterpret_cast<char*>(&m_data[0]), exifSize - offsetToTiffHeader );
-                count = m_stream.gcount();
                 exifFound = true;
                 break;
 
@@ -215,7 +215,7 @@ size_t ExifReader::getFieldSize ()
  * @brief Filling m_exif member with exif directory elements
  *          This is internal function and is not exposed to client
  *
- *  @return The function doesn't return any value. In case of unsiccessful parsing
+ *  @return The function doesn't return any value. In case of unsuccessful parsing
  *      the m_exif member is not filled up
  */
 void ExifReader::parseExif()
@@ -477,7 +477,6 @@ uint32_t ExifReader::getU32(const size_t offset) const
  */
 u_rational_t ExifReader::getURational(const size_t offset) const
 {
-    u_rational_t result;
     uint32_t numerator = getU32( offset );
     uint32_t denominator = getU32( offset + 4 );
 

@@ -5,18 +5,14 @@ if (WIN32 AND NOT ARM)
   message(FATAL_ERROR "BUILD_TBB option supports Windows on ARM only!\nUse regular official TBB build instead of the BUILD_TBB option!")
 endif()
 
-set(tbb_filename "2018_U1.tar.gz")
-set(tbb_subdir "tbb-2018_U1")
-set(tbb_md5 "b2f2fa09adf44a22f4024049907f774b")
-
-set(tbb_version_file "version_string.ver")
-ocv_warnings_disable(CMAKE_CXX_FLAGS /wd4702)
-ocv_warnings_disable(CMAKE_CXX_FLAGS -Wshadow)
-ocv_warnings_disable(CMAKE_CXX_FLAGS -Wunused-parameter)
+ocv_update(OPENCV_TBB_RELEASE "2019_U8")
+ocv_update(OPENCV_TBB_RELEASE_MD5 "7c371d0f62726154d2c568a85697a0ad")
+ocv_update(OPENCV_TBB_FILENAME "${OPENCV_TBB_RELEASE}.tar.gz")
+ocv_update(OPENCV_TBB_SUBDIR "tbb-${OPENCV_TBB_RELEASE}")
 
 set(tbb_src_dir "${OpenCV_BINARY_DIR}/3rdparty/tbb")
-ocv_download(FILENAME ${tbb_filename}
-             HASH ${tbb_md5}
+ocv_download(FILENAME ${OPENCV_TBB_FILENAME}
+             HASH ${OPENCV_TBB_RELEASE_MD5}
              URL
                "${OPENCV_TBB_URL}"
                "$ENV{OPENCV_TBB_URL}"
@@ -28,7 +24,7 @@ ocv_download(FILENAME ${tbb_filename}
 if(NOT res)
   return()
 endif()
-set(tbb_src_dir "${tbb_src_dir}/${tbb_subdir}")
+set(tbb_src_dir "${tbb_src_dir}/${OPENCV_TBB_SUBDIR}")
 
 ocv_include_directories("${tbb_src_dir}/include"
                         "${tbb_src_dir}/src/"
@@ -72,7 +68,7 @@ if(HAVE_PTHREAD)
   add_definitions(-DUSE_PTHREAD) #required for Unix
 endif()
 
-if(CMAKE_COMPILER_IS_GNUCXX AND NOT CMAKE_COMPILER_IS_CLANGCXX)
+if(CV_GCC)
   add_definitions(-DTBB_USE_GCC_BUILTINS=1) #required for ARM GCC
   if(NOT CMAKE_CXX_COMPILER_VERSION LESS 6.0)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -flifetime-dse=1") # workaround for GCC 6.x
@@ -81,24 +77,29 @@ endif()
 
 if(ANDROID_COMPILER_IS_CLANG)
   add_definitions(-D__TBB_GCC_BUILTIN_ATOMICS_PRESENT=1)
-  ocv_warnings_disable(CMAKE_CXX_FLAGS -Wmissing-prototypes)
 endif()
+
+ocv_warnings_disable(CMAKE_CXX_FLAGS
+    /wd4702
+    -Wshadow
+    -Wunused-parameter
+    -Wclass-memaccess                  # TBB 2018 under GCC 8+
+    -Wimplicit-fallthrough             # TBB 2018 under GCC 7+
+    -Wmissing-prototypes               # MacOSX, Android/Clang
+    -Wundef -Wmissing-declarations     # TBB 2019
+)
 
 set(TBB_SOURCE_FILES ${lib_srcs} ${lib_hdrs})
 
-if (ARM AND NOT WIN32)
-  if (NOT ANDROID)
-    set(TBB_SOURCE_FILES ${TBB_SOURCE_FILES} "${CMAKE_CURRENT_SOURCE_DIR}/arm_linux_stub.cpp")
-  endif()
-  set(TBB_SOURCE_FILES ${TBB_SOURCE_FILES} "${CMAKE_CURRENT_SOURCE_DIR}/android_additional.h")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -include \"${CMAKE_CURRENT_SOURCE_DIR}/android_additional.h\"")
-endif()
-
-set(TBB_SOURCE_FILES ${TBB_SOURCE_FILES} "${CMAKE_CURRENT_SOURCE_DIR}/${tbb_version_file}")
+set(tbb_version_file "version_string.ver")
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/${tbb_version_file}.cmakein" "${CMAKE_CURRENT_BINARY_DIR}/${tbb_version_file}" @ONLY)
+list(APPEND TBB_SOURCE_FILES "${CMAKE_CURRENT_BINARY_DIR}/${tbb_version_file}")
 
 add_library(tbb ${TBB_SOURCE_FILES})
 target_compile_definitions(tbb PUBLIC TBB_USE_GCC_BUILTINS=1 __TBB_GCC_BUILTIN_ATOMICS_PRESENT=1)
-target_include_directories(tbb SYSTEM PUBLIC $<BUILD_INTERFACE:${tbb_src_dir}/include>)
+target_include_directories(tbb SYSTEM PUBLIC $<BUILD_INTERFACE:${tbb_src_dir}/include>
+    PRIVATE "${CMAKE_CURRENT_BINARY_DIR}"
+)
 
 if (WIN32)
   if (ARM)
@@ -116,8 +117,6 @@ if (WIN32)
 else()
   target_link_libraries(tbb c m dl)
 endif()
-
-ocv_warnings_disable(CMAKE_CXX_FLAGS -Wundef -Wmissing-declarations)
 
 # filter out flags that are not handled well by the TBB code
 foreach(var CMAKE_CXX_FLAGS CMAKE_CXX_FLAGS_RELEASE CMAKE_CXX_FLAGS_DEBUG)
@@ -150,5 +149,7 @@ ocv_install_target(tbb EXPORT OpenCVModules
     LIBRARY DESTINATION ${OPENCV_LIB_INSTALL_PATH} COMPONENT libs
     ARCHIVE DESTINATION ${OPENCV_3P_LIB_INSTALL_PATH} COMPONENT dev
     )
+
+ocv_install_3rdparty_licenses(tbb "${tbb_src_dir}/LICENSE" "${tbb_src_dir}/README")
 
 ocv_tbb_read_version("${tbb_src_dir}/include")

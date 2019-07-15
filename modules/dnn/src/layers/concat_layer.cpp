@@ -42,15 +42,20 @@
 
 #include "../precomp.hpp"
 #include "layers_common.hpp"
-#include "op_halide.hpp"
+#include "../op_halide.hpp"
+#include "../op_inf_engine.hpp"
+#include "../op_vkcom.hpp"
+
+#ifdef HAVE_OPENCL
 #include "opencl_kernels_dnn.hpp"
+#endif
 
 namespace cv
 {
 namespace dnn
 {
 
-class ConcatLayerImpl : public ConcatLayer
+class ConcatLayerImpl CV_FINAL : public ConcatLayer
 {
 public:
     ConcatLayerImpl(const LayerParams& params)
@@ -63,7 +68,7 @@ public:
     virtual bool getMemoryShapes(const std::vector<MatShape> &inputs,
                                  const int requiredOutputs,
                                  std::vector<MatShape> &outputs,
-                                 std::vector<MatShape> &internals) const
+                                 std::vector<MatShape> &internals) const CV_OVERRIDE
     {
         CV_Assert(inputs.size() > 0);
         outputs.resize(1, inputs[0]);
@@ -87,7 +92,7 @@ public:
                 for (int curAxis = 0; curAxis < outputs[0].size(); curAxis++)
                 {
                     if (curAxis != cAxis && outputs[0][curAxis] != curShape[curAxis])
-                        CV_Error(Error::StsBadSize, "Inconsitent shape for ConcatLayer");
+                        CV_Error(Error::StsBadSize, "Inconsistent shape for ConcatLayer");
                 }
             }
 
@@ -97,21 +102,23 @@ public:
         return false;
     }
 
-    virtual bool supportBackend(int backendId)
+    virtual bool supportBackend(int backendId) CV_OVERRIDE
     {
-        return backendId == DNN_BACKEND_DEFAULT ||
-               backendId == DNN_BACKEND_HALIDE && haveHalide() && axis == 1 && !padding;  // By channels
+        return backendId == DNN_BACKEND_OPENCV ||
+               (backendId == DNN_BACKEND_HALIDE && haveHalide() && axis == 1 && !padding) ||  // By channels
+               (backendId == DNN_BACKEND_INFERENCE_ENGINE && haveInfEngine() && !padding) ||
+               (backendId == DNN_BACKEND_VKCOM && haveVulkan() && !padding);
     }
 
     class ChannelConcatInvoker : public ParallelLoopBody
     {
     public:
-        std::vector<Mat*>* inputs;
+        std::vector<Mat>* inputs;
         Mat* output;
         int nstripes;
         std::vector<const float*> chptrs;
 
-        static void run(std::vector<Mat*>& inputs, Mat& output, int nstripes)
+        static void run(std::vector<Mat>& inputs, Mat& output, int nstripes)
         {
             ChannelConcatInvoker cc;
             cc.inputs = &inputs;
@@ -122,22 +129,22 @@ public:
             int nchannels = 0, batchsz = output.size[0];
             for( i = 0; i < ninputs; i++ )
             {
-                Mat& inp = *inputs[i];
-                CV_Assert( inp.isContinuous() && inp.type() == CV_32F &&
+                Mat& inp = inputs[i];
+                CV_Assert( inp.isContinuous() && (inp.type() == CV_32F || inp.type() == CV_16S) &&
                            inp.dims == 4 && inp.size[0] == output.size[0] &&
                            inp.size[2] == output.size[2] &&
                            inp.size[3] == output.size[3] );
                 nchannels += inp.size[1];
             }
             CV_Assert( nchannels == output.size[1] );
-            CV_Assert( output.isContinuous() && output.type() == CV_32F );
+            CV_Assert( output.isContinuous() && (output.type() == CV_32F || output.type() == CV_16S) );
 
             cc.chptrs.resize(nchannels*batchsz);
 
             int ofs = 0;
             for( i = 0; i < ninputs; i++)
             {
-                Mat& inp = *inputs[i];
+                Mat& inp = inputs[i];
                 for( int j = 0; j < batchsz; j++ )
                     for( int k = 0; k < inp.size[1]; k++ )
                     {
@@ -152,7 +159,7 @@ public:
 
         ChannelConcatInvoker()  : inputs(0), output(0), nstripes(0) {}
 
-        void operator()(const Range& r) const
+        void operator()(const Range& r) const CV_OVERRIDE
         {
             size_t planeSize = (size_t)output->size[2]*output->size[3];
             size_t nch = chptrs.size();
@@ -176,36 +183,41 @@ public:
     };
 
 #ifdef HAVE_OPENCL
-    bool forward_ocl(std::vector<Mat*> &inputs, std::vector<Mat> &outputs, std::vector<Mat> &internals)
+    bool forward_ocl(InputArrayOfArrays inps, OutputArrayOfArrays outs, OutputArrayOfArrays internals)
     {
-        CV_TRACE_FUNCTION();
-        CV_TRACE_ARG_VALUE(name, "name", name.c_str());
+        std::vector<UMat> inputs;
+        std::vector<UMat> outputs;
 
-        int cAxis = clamp(axis, inputs[0]->dims);
-        if (!(cAxis == 1 && outputs[0].dims == 4 && !padding))
+        bool use_half = (inps.depth() == CV_16S);
+        inps.getUMatVector(inputs);
+        outs.getUMatVector(outputs);
+
+        int cAxis = clamp(axis, inputs[0].dims);
+        if (padding)
             return false;
 
         int bottom_concat_axis;
-        int concat_size = inputs[0]->size[2] * inputs[0]->size[3];
-        int top_concat_axis = outputs[0].size[1];
+        int concat_size = total(shape(inputs[0]), cAxis + 1);
+        int top_concat_axis = outputs[0].size[cAxis];
+        int num_concats = total(shape(inputs[0]), 0, cAxis);
         int offset_concat_axis = 0;
-        UMat inpMat, outMat;
-        outMat = outputs[0].getUMat(ACCESS_WRITE);
-
-        ocl::Kernel kernel;
-        String buildopt = String("-DDtype=") + ocl::typeToStr(inputs[0]->type()) + String(" ");
-        if (!kernel.create("concat", ocl::dnn::concat_oclsrc, buildopt))
-            return false;
+        UMat& outMat = outputs[0];
+        String buildopt = format(" -DDtype=%s", (use_half) ? "half" : "float");
+        String kname = format("concat_%s", use_half ? "half" : "float");
 
         for (size_t i = 0; i < inputs.size(); i++)
         {
-            inpMat = inputs[i]->getUMat(ACCESS_READ);
-            bottom_concat_axis = inputs[i]->size[1];
-            size_t nthreads = inputs[i]->total();
+            ocl::Kernel kernel(kname.c_str(), ocl::dnn::concat_oclsrc, buildopt);
+            if (kernel.empty())
+                return false;
+
+            UMat& inpMat = inputs[i];
+            bottom_concat_axis = inputs[i].size[cAxis];
+            size_t nthreads = inputs[i].total();
 
             kernel.set(0, (int)nthreads);
             kernel.set(1, ocl::KernelArg::PtrReadOnly(inpMat));
-            kernel.set(2, (int)inputs[i]->size[0]);
+            kernel.set(2, (int)num_concats);
             kernel.set(3, (int)concat_size);
             kernel.set(4, (int)top_concat_axis);
             kernel.set(5, (int)bottom_concat_axis);
@@ -222,16 +234,19 @@ public:
     }
 #endif
 
-    void forward(std::vector<Mat*> &inputs, std::vector<Mat> &outputs, std::vector<Mat> &internals)
+    void forward(InputArrayOfArrays inputs_arr, OutputArrayOfArrays outputs_arr, OutputArrayOfArrays internals_arr) CV_OVERRIDE
     {
         CV_TRACE_FUNCTION();
         CV_TRACE_ARG_VALUE(name, "name", name.c_str());
 
-        CV_OCL_RUN((preferableTarget == DNN_TARGET_OPENCL) &&
-                   OCL_PERFORMANCE_CHECK(ocl::Device::getDefault().isIntel()),
-                   forward_ocl(inputs, outputs, internals))
+        CV_OCL_RUN(IS_DNN_OPENCL_TARGET(preferableTarget),
+                   forward_ocl(inputs_arr, outputs_arr, internals_arr))
 
-        int cAxis = clamp(axis, inputs[0]->dims);
+        std::vector<Mat> inputs, outputs;
+        inputs_arr.getMatVector(inputs);
+        outputs_arr.getMatVector(outputs);
+
+        int cAxis = clamp(axis, inputs[0].dims);
         Mat& outMat = outputs[0];
 
         if (padding)
@@ -249,20 +264,30 @@ public:
             ranges[cAxis].start = 0;
             for (size_t i = 0; i < inputs.size(); i++)
             {
-                ranges[cAxis].end = ranges[cAxis].start + inputs[i]->size[cAxis];
+                ranges[cAxis].end = ranges[cAxis].start + inputs[i].size[cAxis];
                 for (int j = 0; j < outMat.dims; ++j)
                 {
                     if (j == cAxis) continue;
-                    ranges[j].start = (outMat.size[j] - inputs[i]->size[j]) / 2;
-                    ranges[j].end = ranges[j].start + inputs[i]->size[j];
+                    ranges[j].start = (outMat.size[j] - inputs[i].size[j]) / 2;
+                    ranges[j].end = ranges[j].start + inputs[i].size[j];
                 }
-                inputs[i]->copyTo(outMat(&ranges[0]));
+                inputs[i].copyTo(outMat(&ranges[0]));
                 ranges[cAxis].start = ranges[cAxis].end;
             }
         }
     }
+    virtual Ptr<BackendNode> initVkCom(const std::vector<Ptr<BackendWrapper> > &input) CV_OVERRIDE
+    {
+#ifdef HAVE_VULKAN
+        vkcom::Tensor in = VkComTensor(input[0]);
+        int cAxis = clamp(axis, in.dimNum());
+        std::shared_ptr<vkcom::OpBase> op(new vkcom::OpConcat(cAxis));
+        return Ptr<BackendNode>(new VkComBackendNode(input, op));
+#endif // HAVE_VULKAN
+        return Ptr<BackendNode>();
+    }
 
-    virtual Ptr<BackendNode> initHalide(const std::vector<Ptr<BackendWrapper> > &input)
+    virtual Ptr<BackendNode> initHalide(const std::vector<Ptr<BackendWrapper> > &input) CV_OVERRIDE
     {
 #ifdef HAVE_HALIDE
         std::vector<Halide::Buffer<> > inputBuffers = halideBuffers(input);
@@ -284,6 +309,18 @@ public:
 #endif  // HAVE_HALIDE
         return Ptr<BackendNode>();
     }
+
+#ifdef HAVE_INF_ENGINE
+    virtual Ptr<BackendNode> initInfEngine(const std::vector<Ptr<BackendWrapper> >& inputs) CV_OVERRIDE
+    {
+        InferenceEngine::DataPtr input = infEngineDataNode(inputs[0]);
+
+        InferenceEngine::Builder::ConcatLayer ieLayer(name);
+        ieLayer.setAxis(clamp(axis, input->dims.size()));
+        ieLayer.setInputPorts(std::vector<InferenceEngine::Port>(inputs.size()));
+        return Ptr<BackendNode>(new InfEngineBackendNode(ieLayer));
+    }
+#endif  // HAVE_INF_ENGINE
 };
 
 Ptr<ConcatLayer> ConcatLayer::create(const LayerParams& params)
